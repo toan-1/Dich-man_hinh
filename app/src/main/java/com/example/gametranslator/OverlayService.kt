@@ -4,11 +4,13 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
+import android.content.res.Configuration
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
 import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
@@ -37,6 +39,9 @@ class OverlayService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private var projection: MediaProjection? = null
     private var reader: ImageReader? = null
+    private var vd: VirtualDisplay? = null
+    private var capW = 0
+    private var capH = 0
     private var latest: Image? = null
     private var button: TextView? = null
     private var overlay: FrameLayout? = null
@@ -83,19 +88,37 @@ class OverlayService : Service() {
         startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
     }
 
-    // Android 14+: mỗi MediaProjection chỉ tạo VirtualDisplay 1 lần -> giữ lại và luôn lưu khung hình mới nhất
+    // Android 14+: mỗi MediaProjection chỉ tạo VirtualDisplay 1 lần -> giữ lại, khi xoay màn hình thì resize
     private fun setupCapture() {
         val b = wm.currentWindowMetrics.bounds
-        val r = ImageReader.newInstance(b.width(), b.height(), PixelFormat.RGBA_8888, 3)
+        if (vd != null && b.width() == capW && b.height() == capH) return
+        capW = b.width(); capH = b.height()
+        latest?.close(); latest = null
+        val old = reader
+        val r = ImageReader.newInstance(capW, capH, PixelFormat.RGBA_8888, 3)
         r.setOnImageAvailableListener({ rd ->
             val img = rd.acquireLatestImage()
             if (img != null) { latest?.close(); latest = img }
         }, handler)
         reader = r
-        projection?.createVirtualDisplay(
-            "translator", b.width(), b.height(), resources.displayMetrics.densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, r.surface, null, null
-        )
+        val dpi = resources.displayMetrics.densityDpi
+        val v = vd
+        if (v == null) {
+            vd = projection?.createVirtualDisplay(
+                "translator", capW, capH, dpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, r.surface, null, null
+            )
+        } else {
+            v.resize(capW, capH, dpi)
+            v.surface = r.surface
+        }
+        old?.close()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        clearOverlay()
+        handler.postDelayed({ setupCapture() }, 400)
     }
 
     private fun addButton() {
@@ -126,7 +149,8 @@ class OverlayService : Service() {
     private fun onTap() {
         if (overlay != null) { clearOverlay(); return }
         if (busy) return
-        val img = latest ?: return toast("Chưa có khung hình, thử lại")
+        setupCapture()
+        val img = latest ?: return toast("Chưa có khung hình, bấm lại lần nữa")
         val p = img.planes[0]
         p.buffer.rewind()
         val raw = Bitmap.createBitmap(p.rowStride / p.pixelStride, img.height, Bitmap.Config.ARGB_8888)
@@ -178,7 +202,7 @@ class OverlayService : Service() {
     override fun onDestroy() {
         clearOverlay()
         button?.let { runCatching { wm.removeView(it) } }
-        latest?.close(); reader?.close(); projection?.stop()
+        latest?.close(); vd?.release(); reader?.close(); projection?.stop()
         translator.close(); recognizer.close()
         super.onDestroy()
     }
