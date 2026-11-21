@@ -9,6 +9,9 @@ import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Rect
+import android.util.TypedValue
+import android.view.View
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.Image
@@ -33,6 +36,7 @@ import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 
 class OverlayService : Service() {
     private lateinit var wm: WindowManager
@@ -175,24 +179,72 @@ class OverlayService : Service() {
             gravity = Gravity.TOP or Gravity.START
             layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         }
+        val blocks = text.textBlocks.filter { han.containsMatchIn(it.text) && it.boundingBox != null }
+        if (blocks.isEmpty()) { toast("Không thấy chữ Trung"); return }
         wm.addView(view, lp)
         overlay = view
-        val blocks = text.textBlocks.filter { han.containsMatchIn(it.text) && it.boundingBox != null }
-        if (blocks.isEmpty()) { toast("Không thấy chữ Trung"); clearOverlay(); return }
+
+        // Dịch xong TẤT CẢ các khối rồi mới sắp xếp, để tránh chữ chồng nhau
+        val results = ArrayList<Pair<Rect, String>>()
+        var remaining = blocks.size
+        val done = {
+            remaining--
+            if (remaining == 0) layoutAll(view, results)
+        }
         for (blk in blocks) {
             val box = blk.boundingBox!!
             val src = blk.text.replace("\n", "")
-            val add = { t: String ->
-                view.addView(TextView(this).apply {
-                    this.text = t; textSize = 12f
-                    setTextColor(Color.WHITE); setBackgroundColor(0xCC000000.toInt()); setPadding(8, 4, 8, 4)
-                }, FrameLayout.LayoutParams(max(box.width(), 300), FrameLayout.LayoutParams.WRAP_CONTENT).apply {
-                    leftMargin = box.left; topMargin = box.top
-                })
-            }
             val cached = cache[src]
-            if (cached != null) add(cached)
-            else translator.translate(src).addOnSuccessListener { cache[src] = it; add(it) }
+            if (cached != null) {
+                results.add(Pair(box, cached)); done()
+            } else {
+                translator.translate(src)
+                    .addOnSuccessListener { cache[src] = it; results.add(Pair(box, it)) }
+                    .addOnCompleteListener { done() }
+            }
+        }
+    }
+
+    private fun layoutAll(view: FrameLayout, items: List<Pair<Rect, String>>) {
+        if (overlay !== view) return
+        val placed = ArrayList<Rect>()
+        for ((box, t) in items.sortedWith(compareBy({ it.first.top }, { it.first.left }))) {
+            val w = max(box.width(), 160)
+            val tv = TextView(this).apply {
+                text = t
+                setTextColor(Color.WHITE)
+                setBackgroundColor(0xE6000000.toInt())
+                setPadding(6, 2, 6, 2)
+            }
+            // Thu nhỏ chữ cho vừa khung chữ gốc (tối thiểu 8sp)
+            var size = 14f
+            var h: Int
+            while (true) {
+                tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, size)
+                tv.measure(
+                    View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+                )
+                h = tv.measuredHeight
+                if (h <= box.height() || size <= 8f) break
+                size -= 1f
+            }
+            val left = max(0, min(box.left, capW - w))
+            val r = Rect(left, box.top, left + w, box.top + h)
+            // Nếu đè lên khối đã đặt thì đẩy xuống dưới
+            var moved = true
+            var guard = 0
+            while (moved && guard++ < 50) {
+                moved = false
+                for (p in placed) {
+                    if (Rect.intersects(r, p)) { r.offsetTo(r.left, p.bottom + 2); moved = true }
+                }
+            }
+            if (r.bottom > capH) r.offsetTo(r.left, max(0, capH - h))
+            placed.add(Rect(r))
+            view.addView(tv, FrameLayout.LayoutParams(w, FrameLayout.LayoutParams.WRAP_CONTENT).apply {
+                leftMargin = r.left; topMargin = r.top
+            })
         }
     }
 
