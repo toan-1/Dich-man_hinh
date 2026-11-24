@@ -7,7 +7,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
-        android:label="Game Translator"
+        android:icon="@mipmap/ic_launcher"
+        android:label="DichManhinh"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>

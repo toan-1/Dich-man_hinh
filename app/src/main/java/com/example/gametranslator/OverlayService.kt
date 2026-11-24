@@ -4,14 +4,12 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
-import android.content.res.Configuration
 import android.content.pm.ServiceInfo
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
-import android.util.TypedValue
-import android.view.View
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.Image
@@ -21,8 +19,10 @@ import android.media.projection.MediaProjectionManager
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.TextView
@@ -47,9 +47,13 @@ class OverlayService : Service() {
     private var capW = 0
     private var capH = 0
     private var latest: Image? = null
+    private var frameSeq = 0
     private var button: TextView? = null
     private var overlay: FrameLayout? = null
     private var busy = false
+    private var auto = false
+    private var gen = 0          // tăng lên để huỷ các kết quả dịch đang chạy dở
+    private var lastSig = ""
     private val cache = HashMap<String, String>()
     private val han = Regex("\\p{IsHan}")
 
@@ -102,7 +106,7 @@ class OverlayService : Service() {
         val r = ImageReader.newInstance(capW, capH, PixelFormat.RGBA_8888, 3)
         r.setOnImageAvailableListener({ rd ->
             val img = rd.acquireLatestImage()
-            if (img != null) { latest?.close(); latest = img }
+            if (img != null) { latest?.close(); latest = img; frameSeq++ }
         }, handler)
         reader = r
         val dpi = resources.displayMetrics.densityDpi
@@ -121,28 +125,43 @@ class OverlayService : Service() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        gen++
         clearOverlay()
+        lastSig = ""
         handler.postDelayed({ setupCapture() }, 400)
     }
 
+    // ---------- Nút nổi: chạm = dịch/xoá, nhấn giữ = bật/tắt tự động dịch ----------
     private fun addButton() {
         val lp = WindowManager.LayoutParams(
             140, 140, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START; x = 20; y = 300 }
         val btn = TextView(this).apply {
-            text = "译"; textSize = 22f; gravity = Gravity.CENTER
-            setTextColor(Color.WHITE); setBackgroundColor(0xCC1565C0.toInt())
+            text = "Dịch"; textSize = 15f; gravity = Gravity.CENTER
+            setTextColor(Color.WHITE); setBackgroundColor(COLOR_MANUAL)
         }
-        var downX = 0f; var downY = 0f; var offX = 0f; var offY = 0f; var moved = false
+        var downX = 0f; var downY = 0f; var offX = 0f; var offY = 0f
+        var moved = false; var longFired = false
+        val longPress = Runnable { longFired = true; setAuto(!auto) }
         btn.setOnTouchListener { v, e ->
             when (e.action) {
-                MotionEvent.ACTION_DOWN -> { downX = e.rawX; downY = e.rawY; offX = e.rawX - lp.x; offY = e.rawY - lp.y; moved = false }
+                MotionEvent.ACTION_DOWN -> {
+                    downX = e.rawX; downY = e.rawY; offX = e.rawX - lp.x; offY = e.rawY - lp.y
+                    moved = false; longFired = false
+                    handler.postDelayed(longPress, 600)
+                }
                 MotionEvent.ACTION_MOVE -> {
-                    if (abs(e.rawX - downX) > 15 || abs(e.rawY - downY) > 15) moved = true
+                    if (abs(e.rawX - downX) > 15 || abs(e.rawY - downY) > 15) {
+                        moved = true; handler.removeCallbacks(longPress)
+                    }
                     if (moved) { lp.x = (e.rawX - offX).toInt(); lp.y = (e.rawY - offY).toInt(); wm.updateViewLayout(v, lp) }
                 }
-                MotionEvent.ACTION_UP -> if (!moved) onTap()
+                MotionEvent.ACTION_UP -> {
+                    handler.removeCallbacks(longPress)
+                    if (!moved && !longFired) onTap()
+                }
+                MotionEvent.ACTION_CANCEL -> handler.removeCallbacks(longPress)
             }
             true
         }
@@ -151,49 +170,130 @@ class OverlayService : Service() {
     }
 
     private fun onTap() {
-        if (overlay != null) { clearOverlay(); return }
+        if (auto) { setAuto(false); return }
+        if (overlay != null) { gen++; clearOverlay(); return }
         if (busy) return
+        val bmp = grabBitmap(false) ?: return
+        recognize(bmp)
+    }
+
+    private fun setAuto(on: Boolean) {
+        auto = on
+        gen++
+        lastSig = ""
+        handler.removeCallbacks(autoRunnable)
+        clearOverlay()
+        button?.setBackgroundColor(if (on) COLOR_AUTO else COLOR_MANUAL)
+        if (on) {
+            toast("Tự động dịch: BẬT (chạm nút để tắt)")
+            handler.postDelayed(autoRunnable, 300)
+        } else {
+            toast("Tự động dịch: TẮT")
+        }
+    }
+
+    // ---------- Tự động dịch ----------
+    // Overlay cũng bị chụp vào ảnh nên phải ẩn đi một chút trước khi chụp
+    private val autoRunnable = object : Runnable {
+        override fun run() {
+            if (!auto) return
+            if (busy) { handler.postDelayed(this, 500); return }
+            val ov = overlay
+            if (ov == null) {
+                grabBitmap(true)?.let { recognize(it) }
+                handler.postDelayed(this, 1500)
+            } else {
+                val seq = frameSeq
+                ov.visibility = View.INVISIBLE
+                waitFrame(seq, 0L) {
+                    val bmp = grabBitmap(true)
+                    ov.visibility = View.VISIBLE
+                    if (bmp != null) recognize(bmp)
+                    handler.postDelayed(this, 1500)
+                }
+            }
+        }
+    }
+
+    private fun waitFrame(seq: Int, waited: Long, then: () -> Unit) {
+        if ((frameSeq > seq && waited >= 150) || waited >= 700) then()
+        else handler.postDelayed({ waitFrame(seq, waited + 50, then) }, 50)
+    }
+
+    // ---------- Chụp + OCR ----------
+    private fun grabBitmap(quiet: Boolean): Bitmap? {
         setupCapture()
-        val img = latest ?: return toast("Chưa có khung hình, bấm lại lần nữa")
+        val img = latest
+        if (img == null) {
+            if (!quiet) toast("Chưa có khung hình, bấm lại lần nữa")
+            return null
+        }
         val p = img.planes[0]
         p.buffer.rewind()
         val raw = Bitmap.createBitmap(p.rowStride / p.pixelStride, img.height, Bitmap.Config.ARGB_8888)
         raw.copyPixelsFromBuffer(p.buffer)
-        val bmp = Bitmap.createBitmap(raw, 0, 0, img.width, img.height)
-        busy = true
-        recognizer.process(InputImage.fromBitmap(bmp, 0))
-            .addOnSuccessListener { showTranslations(it) }
-            .addOnFailureListener { toast("OCR lỗi") }
-            .addOnCompleteListener { busy = false }
+        return Bitmap.createBitmap(raw, 0, 0, img.width, img.height)
     }
 
-    private fun showTranslations(text: Text) {
-        val view = FrameLayout(this)
-        val lp = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-        }
-        val blocks = text.textBlocks.filter { han.containsMatchIn(it.text) && it.boundingBox != null }
-        if (blocks.isEmpty()) { toast("Không thấy chữ Trung"); return }
-        wm.addView(view, lp)
-        overlay = view
+    private fun recognize(bmp: Bitmap) {
+        busy = true
+        val g = gen
+        recognizer.process(InputImage.fromBitmap(bmp, 0))
+            .addOnSuccessListener { showTranslations(it, g) }
+            .addOnFailureListener { busy = false; toast("OCR lỗi") }
+    }
 
-        // Dịch xong TẤT CẢ các khối rồi mới sắp xếp, để tránh chữ chồng nhau
+    // Gộp các dòng liền nhau thành 1 đoạn; danh sách dọc (menu) thì mỗi mục là 1 đoạn riêng
+    private fun groupLines(text: Text): List<Pair<Rect, String>> {
+        val out = ArrayList<Pair<Rect, String>>()
+        for (blk in text.textBlocks) {
+            var cur: Rect? = null
+            var last: Rect? = null
+            val sb = StringBuilder()
+            fun flush() {
+                val c = cur
+                if (c != null && sb.isNotEmpty() && han.containsMatchIn(sb)) out.add(Pair(c, sb.toString()))
+                cur = null; last = null; sb.setLength(0)
+            }
+            for (ln in blk.lines) {
+                val r = ln.boundingBox ?: continue
+                if (!han.containsMatchIn(ln.text)) { flush(); continue }
+                val l = last
+                val h = r.height()
+                val join = l != null &&
+                    (r.top - l.bottom) < h * 0.6 && (r.top - l.bottom) > -h * 0.5 &&
+                    abs(r.left - l.left) < h * 2
+                if (!join) flush()
+                val c = cur
+                if (c == null) cur = Rect(r) else c.union(r)
+                sb.append(ln.text)
+                last = r
+            }
+            flush()
+        }
+        return out
+    }
+
+    private fun showTranslations(text: Text, g: Int) {
+        if (g != gen) { busy = false; return }
+        val groups = groupLines(text)
+        if (groups.isEmpty()) {
+            busy = false
+            if (auto) { clearOverlay(); lastSig = "" } else toast("Không thấy chữ Trung")
+            return
+        }
+        val sig = groups.joinToString("|") { "${it.first.left / 20},${it.first.top / 20}:${it.second}" }
+        if (auto && sig == lastSig && overlay != null) { busy = false; return }
+        lastSig = sig
+
+        // Dịch xong TẤT CẢ các đoạn rồi mới sắp xếp
         val results = ArrayList<Pair<Rect, String>>()
-        var remaining = blocks.size
+        var remaining = groups.size
         val done = {
             remaining--
-            if (remaining == 0) layoutAll(view, results)
+            if (remaining == 0) layoutAll(results, g)
         }
-        for (blk in blocks) {
-            val box = blk.boundingBox!!
-            val src = blk.text.replace("\n", "")
+        for ((box, src) in groups) {
             val cached = cache[src]
             if (cached != null) {
                 results.add(Pair(box, cached)); done()
@@ -205,30 +305,47 @@ class OverlayService : Service() {
         }
     }
 
-    private fun layoutAll(view: FrameLayout, items: List<Pair<Rect, String>>) {
-        if (overlay !== view) return
+    private fun measure(tv: TextView, w: Int, sp: Float) {
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp)
+        tv.measure(
+            View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        )
+    }
+
+    private fun layoutAll(items: List<Pair<Rect, String>>, g: Int) {
+        busy = false
+        if (g != gen) return
+        val view = FrameLayout(this)
         val placed = ArrayList<Rect>()
         for ((box, t) in items.sortedWith(compareBy({ it.first.top }, { it.first.left }))) {
-            val w = max(box.width(), 160)
             val tv = TextView(this).apply {
                 text = t
                 setTextColor(Color.WHITE)
                 setBackgroundColor(0xE6000000.toInt())
                 setPadding(6, 2, 6, 2)
             }
-            // Thu nhỏ chữ cho vừa khung chữ gốc (tối thiểu 8sp)
-            var size = 14f
-            var h: Int
-            while (true) {
-                tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, size)
-                tv.measure(
-                    View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
-                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
-                )
-                h = tv.measuredHeight
-                if (h <= box.height() || size <= 8f) break
-                size -= 1f
+            // Thử các độ rộng tăng dần và cỡ chữ giảm dần (16sp -> 9sp) cho vừa khung chữ gốc
+            val maxW = max(capW - box.left, 100)
+            val widths = listOf(1.0, 1.6, 2.4)
+                .map { min(max((box.width() * it).toInt(), 160), maxW) }
+                .distinct()
+            var w = widths.last()
+            var h = 0
+            var fitted = false
+            loop@ for (cw in widths) {
+                var size = 16f
+                while (size >= 9f) {
+                    measure(tv, cw, size)
+                    if (tv.measuredHeight <= box.height() * 1.2) {
+                        w = cw; h = tv.measuredHeight; fitted = true
+                        break@loop
+                    }
+                    size -= 1f
+                }
             }
+            if (!fitted) { measure(tv, w, 9f); h = tv.measuredHeight }
+
             val left = max(0, min(box.left, capW - w))
             val r = Rect(left, box.top, left + w, box.top + h)
             // Nếu đè lên khối đã đặt thì đẩy xuống dưới
@@ -246,16 +363,38 @@ class OverlayService : Service() {
                 leftMargin = r.left; topMargin = r.top
             })
         }
+        val old = overlay
+        wm.addView(view, overlayParams())
+        overlay = view
+        old?.let { runCatching { wm.removeView(it) } }
+    }
+
+    private fun overlayParams() = WindowManager.LayoutParams(
+        WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
+        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+        PixelFormat.TRANSLUCENT
+    ).apply {
+        gravity = Gravity.TOP or Gravity.START
+        layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
     }
 
     private fun clearOverlay() { overlay?.let { runCatching { wm.removeView(it) } }; overlay = null }
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
 
     override fun onDestroy() {
+        auto = false
+        handler.removeCallbacksAndMessages(null)
         clearOverlay()
         button?.let { runCatching { wm.removeView(it) } }
         latest?.close(); vd?.release(); reader?.close(); projection?.stop()
         translator.close(); recognizer.close()
         super.onDestroy()
+    }
+
+    companion object {
+        private const val COLOR_MANUAL = 0xCC1565C0.toInt()
+        private const val COLOR_AUTO = 0xCC2E7D32.toInt()
     }
 }

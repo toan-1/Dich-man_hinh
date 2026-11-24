@@ -2,6 +2,9 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+base {
+    archivesName.set("DichManhinh")
+}
 android {
     namespace = "com.example.gametranslator"
     compileSdk = 34

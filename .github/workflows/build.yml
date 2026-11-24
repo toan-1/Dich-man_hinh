@@ -17,5 +17,5 @@ jobs:
       - run: gradle :app:assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
         with:
-          name: GameTranslator-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: DichManhinh-apk
+          path: app/build/outputs/apk/debug/*.apk
