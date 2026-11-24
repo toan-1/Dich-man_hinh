@@ -1,7 +1,9 @@
 package com.example.gametranslator
 
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -10,6 +12,7 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.graphics.drawable.Icon
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.Image
@@ -19,7 +22,9 @@ import android.media.projection.MediaProjectionManager
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.util.DisplayMetrics
 import android.util.TypedValue
+import android.view.Display
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -29,16 +34,21 @@ import android.widget.TextView
 import android.widget.Toast
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
+import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
+import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
 class OverlayService : Service() {
+    private class Seg(val box: Rect, val text: String, val lineH: Int)
+
     private lateinit var wm: WindowManager
     private val handler = Handler(Looper.getMainLooper())
     private var projection: MediaProjection? = null
@@ -55,22 +65,24 @@ class OverlayService : Service() {
     private var gen = 0          // tăng lên để huỷ các kết quả dịch đang chạy dở
     private var lastSig = ""
     private val cache = HashMap<String, String>()
-    private val han = Regex("\\p{IsHan}")
 
-    private val recognizer = TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
-    private val translator = Translation.getClient(
-        TranslatorOptions.Builder()
-            .setSourceLanguage(TranslateLanguage.CHINESE)
-            .setTargetLanguage(TranslateLanguage.VIETNAMESE)
-            .build()
-    )
+    private var lang = "zh"
+    private var recognizer: TextRecognizer? = null
+    private var translator: Translator? = null
+    private var script = Regex("\\p{IsHan}")
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         wm = getSystemService(WindowManager::class.java)
-        startForegroundNotification()
+        if (intent?.action == ACTION_TOGGLE) {
+            if (projection != null) setLanguage(if (lang == "zh") "ja" else "zh")
+            startForegroundNotification()
+            return START_NOT_STICKY
+        }
         if (projection == null && intent != null) {
+            lang = intent.getStringExtra("lang") ?: "zh"
+            startForegroundNotification()
             @Suppress("DEPRECATION")
             val data = intent.getParcelableExtra<Intent>("data") ?: return START_NOT_STICKY
             projection = getSystemService(MediaProjectionManager::class.java)
@@ -80,27 +92,66 @@ class OverlayService : Service() {
             }, handler)
             setupCapture()
             addButton()
-            translator.downloadModelIfNeeded()
-                .addOnFailureListener { toast("Không tải được model dịch, hãy bật mạng rồi mở lại") }
+            setLanguage(lang)
+        } else {
+            startForegroundNotification()
         }
         return START_NOT_STICKY
+    }
+
+    private fun langName() = if (lang == "ja") "Nhật" else "Trung"
+
+    private fun setLanguage(l: String) {
+        lang = l
+        gen++; busy = false; lastSig = ""
+        cache.clear()
+        clearOverlay()
+        recognizer?.close(); translator?.close()
+        recognizer = if (l == "ja") TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build())
+        else TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
+        script = if (l == "ja") Regex("[\\p{IsHan}\\p{IsHiragana}\\p{IsKatakana}]") else Regex("\\p{IsHan}")
+        val src = if (l == "ja") TranslateLanguage.JAPANESE else TranslateLanguage.CHINESE
+        val tr = Translation.getClient(
+            TranslatorOptions.Builder().setSourceLanguage(src).setTargetLanguage(TranslateLanguage.VIETNAMESE).build()
+        )
+        translator = tr
+        tr.downloadModelIfNeeded()
+            .addOnFailureListener { toast("Không tải được model dịch, hãy bật mạng rồi thử lại") }
+        toast("Đang dịch: ${langName()} → Việt")
     }
 
     private fun startForegroundNotification() {
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel("ov", "Dịch màn hình", NotificationManager.IMPORTANCE_LOW))
-        val n = android.app.Notification.Builder(this, "ov")
-            .setContentTitle("Đang chạy dịch màn hình")
+        val pi = PendingIntent.getService(
+            this, 1, Intent(this, OverlayService::class.java).setAction(ACTION_TOGGLE),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val act = Notification.Action.Builder(
+            Icon.createWithResource(this, android.R.drawable.ic_menu_rotate), "Đổi Trung ↔ Nhật", pi
+        ).build()
+        val n = Notification.Builder(this, "ov")
+            .setContentTitle("DichManhinh đang chạy")
+            .setContentText("Đang dịch: ${langName()} → Việt")
             .setSmallIcon(android.R.drawable.ic_menu_view)
+            .addAction(act)
             .build()
         startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
     }
 
+    // Kích thước thật của màn hình theo hướng hiện tại (dọc hoặc ngang)
+    private fun realSize(): Pair<Int, Int> {
+        val dm = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY).getRealMetrics(dm)
+        return Pair(dm.widthPixels, dm.heightPixels)
+    }
+
     // Android 14+: mỗi MediaProjection chỉ tạo VirtualDisplay 1 lần -> giữ lại, khi xoay màn hình thì resize
     private fun setupCapture() {
-        val b = wm.currentWindowMetrics.bounds
-        if (vd != null && b.width() == capW && b.height() == capH) return
-        capW = b.width(); capH = b.height()
+        val (w, h) = realSize()
+        if (vd != null && w == capW && h == capH) return
+        capW = w; capH = h
         latest?.close(); latest = null
         val old = reader
         val r = ImageReader.newInstance(capW, capH, PixelFormat.RGBA_8888, 3)
@@ -121,6 +172,8 @@ class OverlayService : Service() {
             v.surface = r.surface
         }
         old?.close()
+        // Bản dịch cũ không còn đúng vị trí khi đổi hướng màn hình
+        gen++; lastSig = ""; clearOverlay()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -236,37 +289,44 @@ class OverlayService : Service() {
     }
 
     private fun recognize(bmp: Bitmap) {
+        val rec = recognizer ?: return
         busy = true
         val g = gen
-        recognizer.process(InputImage.fromBitmap(bmp, 0))
+        rec.process(InputImage.fromBitmap(bmp, 0))
             .addOnSuccessListener { showTranslations(it, g) }
             .addOnFailureListener { busy = false; toast("OCR lỗi") }
     }
 
-    // Gộp các dòng liền nhau thành 1 đoạn; danh sách dọc (menu) thì mỗi mục là 1 đoạn riêng
-    private fun groupLines(text: Text): List<Pair<Rect, String>> {
-        val out = ArrayList<Pair<Rect, String>>()
+    // Gộp các dòng liền nhau thành 1 đoạn; danh sách dọc (menu) thì mỗi mục là 1 đoạn riêng.
+    // lineH = cỡ chữ gốc (chiều cao 1 dòng) để chữ dịch có cỡ tỉ lệ theo.
+    private fun groupLines(text: Text): List<Seg> {
+        val out = ArrayList<Seg>()
         for (blk in text.textBlocks) {
             var cur: Rect? = null
             var last: Rect? = null
+            var hSum = 0
+            var n = 0
             val sb = StringBuilder()
             fun flush() {
                 val c = cur
-                if (c != null && sb.isNotEmpty() && han.containsMatchIn(sb)) out.add(Pair(c, sb.toString()))
-                cur = null; last = null; sb.setLength(0)
+                if (c != null && sb.isNotEmpty() && script.containsMatchIn(sb)) {
+                    out.add(Seg(c, sb.toString(), max(1, hSum / max(n, 1))))
+                }
+                cur = null; last = null; hSum = 0; n = 0; sb.setLength(0)
             }
             for (ln in blk.lines) {
                 val r = ln.boundingBox ?: continue
-                if (!han.containsMatchIn(ln.text)) { flush(); continue }
+                if (!script.containsMatchIn(ln.text)) { flush(); continue }
+                val lh = min(r.width(), r.height())
                 val l = last
-                val h = r.height()
                 val join = l != null &&
-                    (r.top - l.bottom) < h * 0.6 && (r.top - l.bottom) > -h * 0.5 &&
-                    abs(r.left - l.left) < h * 2
+                    (r.top - l.bottom) < lh * 0.6 && (r.top - l.bottom) > -lh * 0.5 &&
+                    abs(r.left - l.left) < lh * 2
                 if (!join) flush()
                 val c = cur
                 if (c == null) cur = Rect(r) else c.union(r)
                 sb.append(ln.text)
+                hSum += lh; n++
                 last = r
             }
             flush()
@@ -276,79 +336,94 @@ class OverlayService : Service() {
 
     private fun showTranslations(text: Text, g: Int) {
         if (g != gen) { busy = false; return }
+        val tr = translator
+        if (tr == null) { busy = false; return }
         val groups = groupLines(text)
         if (groups.isEmpty()) {
             busy = false
-            if (auto) { clearOverlay(); lastSig = "" } else toast("Không thấy chữ Trung")
+            if (auto) { clearOverlay(); lastSig = "" }
+            else toast("Không thấy chữ ${langName()}")
             return
         }
-        val sig = groups.joinToString("|") { "${it.first.left / 20},${it.first.top / 20}:${it.second}" }
+        val sig = groups.joinToString("|") { "${it.box.left / 20},${it.box.top / 20}:${it.text}" }
         if (auto && sig == lastSig && overlay != null) { busy = false; return }
         lastSig = sig
 
         // Dịch xong TẤT CẢ các đoạn rồi mới sắp xếp
-        val results = ArrayList<Pair<Rect, String>>()
+        val results = ArrayList<Pair<Seg, String>>()
         var remaining = groups.size
         val done = {
             remaining--
             if (remaining == 0) layoutAll(results, g)
         }
-        for ((box, src) in groups) {
-            val cached = cache[src]
+        for (seg in groups) {
+            val cached = cache[seg.text]
             if (cached != null) {
-                results.add(Pair(box, cached)); done()
+                results.add(Pair(seg, cached)); done()
             } else {
-                translator.translate(src)
-                    .addOnSuccessListener { cache[src] = it; results.add(Pair(box, it)) }
+                tr.translate(seg.text)
+                    .addOnSuccessListener { cache[seg.text] = it; results.add(Pair(seg, it)) }
                     .addOnCompleteListener { done() }
             }
         }
     }
 
-    private fun measure(tv: TextView, w: Int, sp: Float) {
-        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp)
+    private fun measure(tv: TextView, w: Int, px: Float) {
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, px)
         tv.measure(
             View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
             View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
         )
     }
 
-    private fun layoutAll(items: List<Pair<Rect, String>>, g: Int) {
+    private fun layoutAll(items: List<Pair<Seg, String>>, g: Int) {
         busy = false
         if (g != gen) return
         val view = FrameLayout(this)
         val placed = ArrayList<Rect>()
-        for ((box, t) in items.sortedWith(compareBy({ it.first.top }, { it.first.left }))) {
+        for ((seg, t) in items.sortedWith(compareBy({ it.first.box.top }, { it.first.box.left }))) {
+            val box = seg.box
             val tv = TextView(this).apply {
                 text = t
                 setTextColor(Color.WHITE)
                 setBackgroundColor(0xE6000000.toInt())
-                setPadding(6, 2, 6, 2)
+                gravity = Gravity.CENTER_VERTICAL
+                minHeight = box.height()      // phủ kín khung chữ gốc
+                setPadding(max(3, seg.lineH / 6), max(1, seg.lineH / 16), max(3, seg.lineH / 6), max(1, seg.lineH / 16))
             }
-            // Thử các độ rộng tăng dần và cỡ chữ giảm dần (16sp -> 9sp) cho vừa khung chữ gốc
-            val maxW = max(capW - box.left, 100)
-            val widths = listOf(1.0, 1.6, 2.4)
-                .map { min(max((box.width() * it).toInt(), 160), maxW) }
+            // Cỡ chữ tỉ lệ theo chữ gốc: 0.85 x chiều cao dòng gốc, giảm dần tới 0.5 x nếu chưa vừa khung
+            val ideal = max(seg.lineH * 0.85f, 14f)
+            val minPx = max(seg.lineH * 0.5f, 12f)
+            // Mở rộng ngang khi cần, nhưng không lấn sang chữ gốc của khối khác
+            val others = items.map { it.first.box }.filter { it !== box }
+            val maxW = max(capW - box.left, 80)
+            val widths = listOf(1.0, 1.4, 2.0, 3.0)
+                .map { min(max((box.width() * it).toInt(), 80), maxW) }
                 .distinct()
+                .filterIndexed { i, cw ->
+                    i == 0 || others.none {
+                        Rect.intersects(Rect(box.left, box.top, box.left + cw, box.top + box.height()), it)
+                    }
+                }
+            var px = ideal
             var w = widths.last()
             var h = 0
             var fitted = false
-            loop@ for (cw in widths) {
-                var size = 16f
-                while (size >= 9f) {
-                    measure(tv, cw, size)
-                    if (tv.measuredHeight <= box.height() * 1.2) {
+            while (px >= minPx && !fitted) {
+                for (cw in widths) {
+                    measure(tv, cw, px)
+                    if (tv.measuredHeight <= box.height() * 1.15) {
                         w = cw; h = tv.measuredHeight; fitted = true
-                        break@loop
+                        break
                     }
-                    size -= 1f
                 }
+                if (!fitted) px *= 0.92f
             }
-            if (!fitted) { measure(tv, w, 9f); h = tv.measuredHeight }
+            if (!fitted) { w = widths.last(); measure(tv, w, minPx); h = tv.measuredHeight }
 
             val left = max(0, min(box.left, capW - w))
             val r = Rect(left, box.top, left + w, box.top + h)
-            // Nếu đè lên khối đã đặt thì đẩy xuống dưới
+            // Nếu đè lên bản dịch đã đặt thì đẩy xuống dưới
             var moved = true
             var guard = 0
             while (moved && guard++ < 50) {
@@ -389,11 +464,12 @@ class OverlayService : Service() {
         clearOverlay()
         button?.let { runCatching { wm.removeView(it) } }
         latest?.close(); vd?.release(); reader?.close(); projection?.stop()
-        translator.close(); recognizer.close()
+        translator?.close(); recognizer?.close()
         super.onDestroy()
     }
 
     companion object {
+        private const val ACTION_TOGGLE = "com.example.gametranslator.TOGGLE_LANG"
         private const val COLOR_MANUAL = 0xCC1565C0.toInt()
         private const val COLOR_AUTO = 0xCC2E7D32.toInt()
     }
